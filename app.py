@@ -1,123 +1,176 @@
 import streamlit as st
-from ultralytics import YOLO
-from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
-import av  # PyAV for handling video frames
+import cv2
 import numpy as np
-import cv2 # OpenCV is still used internally by Ultralytics/PyAV
+from ultralytics import YOLO
+import tempfile
+import time
 
 # --- Configuration ---
-MODEL_PATH = 'yolov8n.pt'
-st.set_page_config(
-    page_title="YOLOv8 Live Camera Detector",
-    layout="centered"
-)
+# Dictionary of available YOLO models and their corresponding weight file names.
+# These weights are automatically downloaded by the ultralytics library if not present locally.
+MODEL_OPTIONS = {
+    'YOLOv8 Nano (Fastest)': 'yolov8n.pt',
+    'YOLOv8 Small (Default)': 'yolov8s.pt',
+    'YOLOv8 Medium (Balanced)': 'yolov8m.pt',
+    'YOLOv8 Large (High Accuracy)': 'yolov8l.pt',
+    'YOLOv8 Extra Large (Highest Accuracy)': 'yolov8x.pt',
+    # You could also add custom models or other versions like 'yolov5s.pt' here.
+}
 
-# --- Model Loading with Caching ---
-# Caching the model is essential for performance
+# --- Utility Functions ---
+
+# Use Streamlit's caching to load the model only once
 @st.cache_resource
-def load_yolo_model(path):
-    """Loads the YOLOv8 model."""
+def load_model(model_path):
+    """Loads the YOLO model and caches it."""
     try:
-        model = YOLO(path)
+        model = YOLO(model_path)
         return model
     except Exception as e:
-        st.error(f"Failed to load the model from {path}.")
-        st.error(f"Error: {e}")
+        st.error(f"Error loading model {model_path}: {e}")
         return None
 
-# Load the model outside the class
-MODEL = load_yolo_model(MODEL_PATH)
-if MODEL is None:
-    st.stop() # Stop the app if model loading failed
-
-# --- Video Processing Class for WebRTC ---
-
-class YOLOv8LiveTransformer(VideoTransformerBase):
-    """
-    This class is the core of the real-time processing.
-    The 'recv' method is called for every frame from the webcam.
-    """
-    def __init__(self, model):
-        self.model = model
-        # Default confidence threshold
-        self.confidence_threshold = 0.25 
+def process_video(uploaded_file, model, conf_threshold):
+    """Handles video processing and object detection."""
+    # Save the uploaded file temporarily
+    tfile = tempfile.NamedTemporaryFile(delete=False)
+    tfile.write(uploaded_file.read())
+    tfile_path = tfile.name
     
-    # Method to update confidence from Streamlit UI (must be thread-safe)
-    def set_confidence(self, threshold):
-        self.confidence_threshold = threshold
+    cap = cv2.VideoCapture(tfile_path)
+    if not cap.isOpened():
+        st.error("Error: Could not open video file.")
+        return
 
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        # Convert the PyAV frame to a NumPy array in BGR format
-        img = frame.to_ndarray(format="bgr24")
+    # Get video properties
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    # Create placeholders for displaying video and statistics
+    st.subheader("Detected Video Stream")
+    video_placeholder = st.empty()
+    fps_placeholder = st.empty()
+    
+    # Process video frame by frame
+    frame_count = 0
+    start_time = time.time()
+    
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
         
-        # Run YOLOv8 inference on the frame
-        # The source is the NumPy array (img)
-        # verbose=False suppresses console output for cleaner logs
-        results = self.model.predict(
-            source=img, 
-            conf=self.confidence_threshold, 
-            verbose=False,
-            # Adjust these for deployment. 
-            # Lowering the resolution can increase FPS.
-            # imgsz=320 
+        # Run YOLO inference
+        results = model.predict(
+            source=frame, 
+            conf=conf_threshold, 
+            stream=False, 
+            verbose=False
         )
-
-        # Get the annotated frame (NumPy array with boxes/labels drawn)
+        
+        # Plot results on the frame (using BGR format from OpenCV)
         annotated_frame = results[0].plot()
 
-        # Convert the annotated NumPy array back to a PyAV VideoFrame
-        return av.VideoFrame.from_ndarray(annotated_frame, format="bgr24")
+        # Convert the frame from BGR (OpenCV default) to RGB for Streamlit display
+        annotated_frame_rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+        
+        # Display the frame
+        video_placeholder.image(annotated_frame_rgb, channels="RGB", use_column_width=True)
+        
+        frame_count += 1
+        
+        # Update FPS display every 10 frames
+        if frame_count % 10 == 0:
+            elapsed_time = time.time() - start_time
+            current_fps = frame_count / elapsed_time if elapsed_time > 0 else 0
+            fps_placeholder.metric(label="FPS (Inference Speed)", value=f"{current_fps:.2f}", delta_label="Real-time performance", delta_color="normal")
+            
+    cap.release()
+    tfile.close()
+    st.success("Video processing complete!")
 
-# --- Streamlit UI ---
-st.title("Live Camera Object Detection (YOLOv8)")
-st.caption("Powered by Streamlit, YOLOv8, and streamlit-webrtc.")
 
-# Sidebar for controls
-with st.sidebar:
-    st.header("Detection Settings")
+# --- Streamlit App Layout ---
+def main():
+    """Main function to run the Streamlit application."""
+    st.title("Object Detection Platform")
+    st.subheader("Select Model Version and Upload Video for Inference")
     
-    # Create a unique key in session state to hold the confidence value
-    if 'live_conf' not in st.session_state:
-        st.session_state.live_conf = 0.25
-
-    # Slider for confidence threshold
-    confidence = st.slider(
-        "Confidence Threshold", 
-        min_value=0.01, 
-        max_value=1.0, 
-        value=st.session_state.live_conf, 
-        step=0.01,
-        key="confidence_slider"
+    # --- Sidebar for Configuration ---
+    st.sidebar.header("Configuration")
+    
+    # 1. Model Selection Dropdown
+    model_name = st.sidebar.selectbox(
+        'Select YOLO Model Version:',
+        options=list(MODEL_OPTIONS.keys()),
+        index=1, # Default to YOLOv8 Small
+        help="Different models offer varying trade-offs between speed (FPS) and accuracy (mAP)."
     )
-    # Update the session state
-    st.session_state.live_conf = confidence
+    
+    model_path = MODEL_OPTIONS[model_name]
+    
+    # 2. Confidence Slider
+    conf_threshold = st.sidebar.slider(
+        'Detection Confidence Threshold',
+        min_value=0.01,
+        max_value=1.0,
+        value=0.25,
+        step=0.01,
+        help="Lowering the threshold detects more objects, but increases false positives."
+    )
+    
+    # 3. Load the selected model
+    st.sidebar.markdown("---")
+    st.sidebar.info(f"Loading weights for: **{model_name}**")
+    model = load_model(model_path)
+    
+    if model is None:
+        st.stop()
+        
+    # --- Main Content Area ---
+    
+    st.header("Upload Video or Image")
 
-# Initialize the WebRTC stream
-ctx = webrtc_streamer(
-    key="yolo-live-detection",
-    mode=WebRtcMode.SENDRECV,
-    # Pass the VideoTransformer class to the factory
-    video_transformer_factory=lambda: YOLOv8LiveTransformer(MODEL), 
-    # Constraints to request video but not audio
-    media_stream_constraints={
-        "video": True,
-        "audio": False
-    },
-    # Configuration for STUN server to work across different networks
-    rtc_configuration={
-        "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
-    },
-    async_processing=True # Allows frames to be processed in a separate thread
-)
+    # 4. File Uploader
+    uploaded_file = st.file_uploader(
+        "Upload a video or image file (.mp4, .mov, .jpg, .png)",
+        type=['mp4', 'mov', 'avi', 'jpg', 'jpeg', 'png']
+    )
+    
+    if uploaded_file is not None:
+        file_type = uploaded_file.type.split('/')[0]
+        
+        if file_type == 'video':
+            st.video(uploaded_file)
+            if st.button('Start Object Detection'):
+                with st.spinner(f"Running detection on video using {model_name}..."):
+                    process_video(uploaded_file, model, conf_threshold)
+        
+        elif file_type == 'image':
+            # Display Image logic (simplified for the scope of this request)
+            st.image(uploaded_file, caption='Uploaded Image', use_column_width=True)
+            
+            # Since the model is loaded, we can run inference directly
+            if st.button('Detect Objects'):
+                with st.spinner(f"Running detection on image using {model_name}..."):
+                    
+                    # Convert uploaded file to OpenCV image format
+                    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+                    image = cv2.imdecode(file_bytes, 1) # BGR
+                    
+                    # Run inference
+                    results = model.predict(source=image, conf=conf_threshold, verbose=False)
+                    annotated_image = results[0].plot()
+                    
+                    # Convert to RGB for Streamlit
+                    annotated_image_rgb = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB)
+                    
+                    st.subheader("Detected Image")
+                    st.image(annotated_image_rgb, caption='Detected Objects', use_column_width=True)
+                    st.success("Detection complete!")
+        else:
+            st.warning("Unsupported file type. Please upload a video or image.")
 
-# Logic to pass the confidence threshold to the transformer
-if ctx.video_transformer:
-    # Safely update the confidence on the transformer instance
-    ctx.video_transformer.set_confidence(st.session_state.live_conf)
-
-    # Display real-time frame rate in the app (optional)
-    if st.checkbox("Show Performance Info"):
-        st.info("Performance stats can be displayed here, but require more complex thread-safe state management.")
-
-st.markdown("---")
-st.write("Click **START** to begin streaming from your webcam.")
+if __name__ == '__main__':
+    main()
