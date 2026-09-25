@@ -1,8 +1,6 @@
-
-
 import streamlit as st
 from ultralytics import YOLO
-from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 import av  # PyAV for handling video frames
 import numpy as np
 import cv2 # OpenCV is still used internally by Ultralytics/PyAV
@@ -34,7 +32,7 @@ if MODEL is None:
 
 # --- Video Processing Class for WebRTC ---
 
-class YOLOv8LiveTransformer(VideoTransformerBase):
+class YOLOv8LiveTransformer(VideoProcessorBase):
     """
     This class is the core of the real-time processing.
     The 'recv' method is called for every frame from the webcam.
@@ -98,8 +96,8 @@ with st.sidebar:
 ctx = webrtc_streamer(
     key="yolo-live-detection",
     mode=WebRtcMode.SENDRECV,
-    # Pass the VideoTransformer class to the factory
-    video_transformer_factory=lambda: YOLOv8LiveTransformer(MODEL), 
+    # Pass the VideoProcessor class to the factory
+    video_processor_factory=lambda: YOLOv8LiveTransformer(MODEL), 
     # Constraints to request video but not audio
     media_stream_constraints={
         "video": True,
@@ -112,10 +110,10 @@ ctx = webrtc_streamer(
     async_processing=True # Allows frames to be processed in a separate thread
 )
 
-# Logic to pass the confidence threshold to the transformer
-if ctx.video_transformer:
-    # Safely update the confidence on the transformer instance
-    ctx.video_transformer.set_confidence(st.session_state.live_conf)
+# Logic to pass the confidence threshold to the processor
+if ctx.video_processor:
+    # Safely update the confidence on the processor instance
+    ctx.video_processor.set_confidence(st.session_state.live_conf)
 
     # Display real-time frame rate in the app (optional)
     if st.checkbox("Show Performance Info"):
